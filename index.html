@@ -609,6 +609,16 @@
       </div>
 
       <div class="settings-block">
+        <h3>영수증 인식(OCR) 설정</h3>
+        <p class="desc">영수증 사진 인식은 <a href="https://ocr.space/ocrapi/freekey" target="_blank" rel="noopener" style="color:var(--accent);">OCR.space 무료 API</a>를 사용합니다 (이메일만 입력하면 즉시 키 발급, 카드 등록 불필요). 발급받은 키를 아래에 붙여넣어 주세요 — 이 브라우저에만 저장되고 OCR.space로만 전송됩니다.</p>
+        <div class="btn-row">
+          <input type="text" id="ocrApiKeyInput" placeholder="OCR.space API 키 붙여넣기" style="flex:1;border:1px solid var(--border);border-radius:10px;padding:10px 12px;font-size:0.85rem;background:var(--bg);color:var(--text);" />
+          <button class="btn" id="saveOcrApiKey">저장</button>
+        </div>
+        <p class="desc" style="margin-top:10px;margin-bottom:0;">한국어·영어 영수증을 함께 인식합니다. 인도네시아어는 별도 라틴 문자 기반이라 영어 인식 모드로 함께 처리됩니다.</p>
+      </div>
+
+      <div class="settings-block">
         <h3>지출 카테고리 관리</h3>
         <div class="chip-list" id="expenseCatChips"></div>
         <div class="add-cat-row">
@@ -1115,6 +1125,7 @@
 
   /* ---------- Settings ---------- */
   function renderSettings(){
+    document.getElementById("ocrApiKeyInput").value = getOcrApiKey();
     renderCatChips("expense", "expenseCatChips");
     renderCatChips("income", "incomeCatChips");
     renderRuleList();
@@ -1325,56 +1336,87 @@
     showToast("삭제되었습니다.");
   });
 
-  /* ---------- Receipt OCR ---------- */
+  /* ---------- Receipt OCR (OCR.space free API: kor + eng, covers Indonesian via Latin script) ---------- */
   var ocrOverlay = document.getElementById("ocrOverlay");
-  var tesseractLoadPromise = null;
-  function loadTesseract(){
-    if (window.Tesseract) return Promise.resolve();
-    if (tesseractLoadPromise) return tesseractLoadPromise;
-    tesseractLoadPromise = new Promise(function(resolve, reject){
-      var s = document.createElement("script");
-      s.src = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
-      s.onload = function(){ resolve(); };
-      s.onerror = function(){ tesseractLoadPromise = null; reject(new Error("tesseract-load-failed")); };
-      document.head.appendChild(s);
-    });
-    return tesseractLoadPromise;
+  var OCR_API_KEY_STORAGE = "household-ledger-ocrspace-key";
+  function getOcrApiKey(){ return (localStorage.getItem(OCR_API_KEY_STORAGE) || "").trim(); }
+  function setOcrApiKey(key){
+    if (key) localStorage.setItem(OCR_API_KEY_STORAGE, key);
+    else localStorage.removeItem(OCR_API_KEY_STORAGE);
   }
+  document.getElementById("saveOcrApiKey").addEventListener("click", function(){
+    var val = document.getElementById("ocrApiKeyInput").value.trim();
+    setOcrApiKey(val);
+    showToast(val ? "API 키가 저장되었습니다." : "API 키가 삭제되었습니다.");
+  });
+
   function showOcrOverlay(){ ocrOverlay.classList.add("active"); }
   function hideOcrOverlay(){ ocrOverlay.classList.remove("active"); }
   function setOcrStatus(text){ document.getElementById("ocrStatus").textContent = text; }
 
-  var OCR_STATUS_LABEL = {
-    "loading tesseract core": "OCR 엔진 불러오는 중",
-    "initializing tesseract": "OCR 엔진 초기화 중",
-    "loading language traineddata": "언어 데이터 불러오는 중",
-    "initializing api": "준비 중",
-    "recognizing text": "글자 인식 중"
-  };
-  function ocrLogger(m){
-    if (!m || !m.status) return;
-    var label = OCR_STATUS_LABEL[m.status] || m.status;
-    var pct = (typeof m.progress === "number") ? (" " + Math.round(m.progress * 100) + "%") : "";
-    setOcrStatus(label + pct + "...");
+  function extractParsedText(data){
+    if (!data || data.IsErroredOnProcessing) return null;
+    var r = data.ParsedResults && data.ParsedResults[0];
+    if (!r || r.ErrorMessage) return null;
+    return r.ParsedText || "";
+  }
+  function ocrSpaceCall(file, apiKey, language, engine){
+    var fd = new FormData();
+    fd.append("apikey", apiKey);
+    fd.append("file", file);
+    fd.append("OCREngine", String(engine));
+    fd.append("scale", "true");
+    fd.append("detectOrientation", "true");
+    fd.append("language", language);
+    return fetch("https://api.ocr.space/parse/image", { method: "POST", body: fd })
+      .then(function(res){ return res.json(); });
+  }
+  function ocrSpaceRecognize(file, apiKey, language){
+    return ocrSpaceCall(file, apiKey, language, 2).then(function(data){
+      var text = extractParsedText(data);
+      if (text === null){
+        return ocrSpaceCall(file, apiKey, language, 1).then(function(data2){
+          return extractParsedText(data2) || "";
+        });
+      }
+      return text;
+    }).catch(function(){ return ""; });
+  }
+  function pickBetterOcrText(korText, engText){
+    var korHasAmount = !!extractAmount(korText);
+    var engHasAmount = !!extractAmount(engText);
+    if (korHasAmount && !engHasAmount) return korText;
+    if (engHasAmount && !korHasAmount) return engText;
+    return (korText.replace(/\s/g,"").length >= engText.replace(/\s/g,"").length) ? korText : engText;
   }
 
   document.getElementById("fabReceipt").addEventListener("click", function(){
+    if (!getOcrApiKey()){
+      showToast("설정 탭에서 OCR.space 무료 API 키를 먼저 등록해주세요.");
+      return;
+    }
     document.getElementById("receiptFile").click();
   });
   document.getElementById("receiptFile").addEventListener("change", function(e){
     var file = e.target.files[0];
     e.target.value = "";
     if (!file) return;
-    setOcrStatus("이미지를 불러오는 중...");
+    var apiKey = getOcrApiKey();
+    if (!apiKey){
+      showToast("설정 탭에서 OCR.space 무료 API 키를 먼저 등록해주세요.");
+      return;
+    }
+    setOcrStatus("영수증을 분석하는 중입니다 (한국어/영어)...");
     showOcrOverlay();
-    loadTesseract().then(function(){
-      return Tesseract.recognize(file, "kor+eng", { logger: ocrLogger });
-    }).then(function(result){
+    Promise.all([
+      ocrSpaceRecognize(file, apiKey, "kor"),
+      ocrSpaceRecognize(file, apiKey, "eng")
+    ]).then(function(results){
       hideOcrOverlay();
-      handleOcrResult(result.data.text);
+      handleOcrResult(pickBetterOcrText(results[0] || "", results[1] || ""));
     }).catch(function(err){
       hideOcrOverlay();
-      showToast("영수증 인식에 실패했습니다. 인터넷 연결을 확인하거나 직접 입력해주세요.");
+      showToast("영수증 인식에 실패했습니다. API 키 또는 인터넷 연결을 확인해주세요.");
       console.error(err);
     });
   });
